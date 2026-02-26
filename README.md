@@ -10,11 +10,15 @@ Batch-converts audio files to **16-bit / 44.1 kHz / stereo WAV** with **loudness
   sudo pacman -S ffmpeg      # Arch
   brew install ffmpeg         # macOS
   ```
-- **zenity** (optional, for GUI mode) — install via your package manager:
+- **python3-tk** (optional, for GUI mode) — install via your package manager:
   ```bash
-  sudo apt install zenity    # Debian/Ubuntu
-  sudo pacman -S zenity      # Arch
-  brew install zenity         # macOS
+  sudo apt install python3-tk    # Debian/Ubuntu
+  sudo pacman -S tk               # Arch
+  brew install python-tk           # macOS
+  ```
+- **customtkinter** (auto-installed on first GUI launch, or install manually):
+  ```bash
+  pip install customtkinter
   ```
 
 ## Usage
@@ -25,14 +29,13 @@ Batch-converts audio files to **16-bit / 44.1 kHz / stereo WAV** with **loudness
 ./convert.sh
 ```
 
-When launched without any arguments, a graphical wizard (powered by Zenity) guides you through the configuration:
+When launched without any arguments, a single-window graphical interface (powered by Python/tkinter) opens with all settings on one screen:
 
-1. **Source directory** — pick the folder containing your audio files
-2. **Destination directory** — pick where converted files will be saved
-3. **Settings** — configure target loudness, true peak, sample rate, bit depth, and force mode via dropdown menus with inline descriptions. Recommended values are pre-selected.
-4. **Confirmation** — review all settings before starting
+- **Folders** — source and destination paths pre-filled with defaults (`music_converter/input` and `music_converter/output`), with Browse buttons for custom directories
+- **Audio Settings** — dropdowns for target loudness, true peak, sample rate, and bit depth, with sensible defaults pre-selected
+- **Processing** — checkboxes for force re-conversion and parallel processing, with a CPU cores dropdown that activates when parallel is enabled
 
-Cancelling any dialog exits gracefully.
+Hover any setting for a tooltip explaining what it does. The GUI uses a modern dark theme with rounded widgets and an accent-colored Start button (powered by CustomTkinter). Click "Start Conversion" to begin, or "Cancel" (or close the window) to exit gracefully.
 
 ### CLI mode
 
@@ -93,6 +96,24 @@ All files are normalized to **-11 LUFS** using ffmpeg's `loudnorm` filter with a
 **Why -11 LUFS?** Streaming services target -14 LUFS, but for DJ and car use a hotter level gives a better baseline without requiring the volume knob to be maxed out. The true peak limiter prevents digital clipping.
 
 **Note**: Two-pass normalization takes roughly 2x longer than a simple conversion since each file is read twice, but the result is significantly more accurate than single-pass.
+
+## Parallel Processing
+
+In GUI mode, you can enable **parallel processing** to convert multiple files simultaneously using multiple CPU cores. This is disabled by default (sequential processing).
+
+When enabled, you can choose how many CPU cores to use:
+
+| Option | Description |
+|---|---|
+| **All available** (default) | Uses all CPU cores for maximum speed |
+| **Half** | Uses half the cores, leaving headroom for other tasks |
+| **2 cores** | Light background load |
+
+The core count options are built dynamically based on your machine's actual CPU count (via `nproc`). On a 2-core machine, only "All available" is shown.
+
+Parallel mode uses a job pool with temporary result files and `flock`-based thread-safe logging to prevent interleaved log entries. The progress bar shows the number of parallel workers instead of individual filenames.
+
+**Note**: Parallel processing is only available in GUI mode. CLI mode always runs sequentially.
 
 ## Behavior by File Type
 
