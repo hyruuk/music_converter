@@ -274,9 +274,6 @@ parallel_var = tk.IntVar(value=0)
 # Build cores list: "Max (N)" + every number from max down to 2
 cores_values = [f"Max ({max_cores})"] + [str(n) for n in range(max_cores, 1, -1)]
 cores_var = tk.StringVar(value=cores_values[0])
-cores_menu = ctk.CTkOptionMenu(proc_content, values=cores_values,
-                                variable=cores_var, width=220)
-cores_menu.configure(state="disabled")
 
 def toggle_cores():
     cores_menu.configure(state="normal" if parallel_var.get() == 1 else "disabled")
@@ -289,7 +286,9 @@ ToolTip(par_chk, "Process multiple files simultaneously\nusing multiple CPU core
 cores_row = ctk.CTkFrame(proc_content, fg_color="transparent")
 cores_row.pack(fill="x", pady=(6, 0))
 ctk.CTkLabel(cores_row, text="CPU Cores:", width=90).pack(side="left", padx=(24, 8))
-cores_menu.pack(in_=cores_row, side="left")
+cores_menu = ctk.CTkOptionMenu(cores_row, values=cores_values,
+                                variable=cores_var, width=220, state="disabled")
+cores_menu.pack(side="left")
 ToolTip(cores_menu, "Number of CPU cores for parallel processing.\nMore cores = faster but heavier system load.")
 
 # --- Buttons ---
