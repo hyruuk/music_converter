@@ -23,6 +23,14 @@ DEST_DIR=""
 LOG_FILE=""
 FORCE_MODE=false
 PARALLEL_JOBS=1    # 1 = sequential (default); >1 = parallel workers (GUI only)
+ANALYZE_BPM=false
+ANALYZE_KEY=false
+KEY_FORMAT="standard"       # standard | camelot | openkey
+VERIFY_INTEGRITY=false
+CLEAN_METADATA=false
+PROGRESS_FIFO=""     # Path to progress-window FIFO (empty = no GUI progress window)
+PROGRESS_PID=""      # PID of background Python progress window
+PROGRESS_SCRIPT=""   # Path to temp Python script for progress window
 
 # --- Help message ---
 usage() {
@@ -100,6 +108,7 @@ launch_gui() {
   local gui_output
   gui_output=$(python3 - "$default_input" "$default_output" "$max_cores" << 'PYTHON_GUI'
 import sys
+import os
 import re
 import tkinter as tk
 from tkinter import filedialog
@@ -123,7 +132,7 @@ ui_scale = max(1.0, screen_h / 1080)
 ctk.set_widget_scaling(ui_scale)
 
 # Set window size scaled to resolution, allow vertical resize
-base_w, base_h = 580, 660
+base_w, base_h = 580, 840
 win_w = int(base_w * ui_scale)
 win_h = int(base_h * ui_scale)
 app.geometry(f"{win_w}x{win_h}")
@@ -254,6 +263,53 @@ bd_var = make_option(audio_grid, "Bit Depth:", bd_values, 3,
 
 audio_grid.columnconfigure(1, weight=1)
 
+# --- Tag Analysis section ---
+tag_sec = ctk.CTkFrame(app, corner_radius=10)
+tag_sec.pack(fill="x", padx=20, pady=4)
+
+ctk.CTkLabel(tag_sec, text="Tag Analysis",
+             font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=14, pady=(12, 4))
+
+tag_content = ctk.CTkFrame(tag_sec, fg_color="transparent")
+tag_content.pack(fill="x", padx=14, pady=(0, 12))
+
+bpm_var = tk.IntVar(value=0)
+bpm_chk = ctk.CTkCheckBox(tag_content, text="Analyze & write BPM tag", variable=bpm_var)
+bpm_chk.pack(anchor="w")
+ToolTip(bpm_chk, "Detects BPM and writes TBPM tag to the output WAV.\nRequires: pip install aubio")
+
+key_format_values = [
+    "standard — Am, C, F#m  (Traktor default)",
+    "camelot — 8A, 8B  (DJ notation)",
+    "openkey — 6m, 6d",
+]
+key_format_var = tk.StringVar(value=key_format_values[0])
+
+def toggle_key_format():
+    key_format_menu.configure(state="normal" if key_var.get() == 1 else "disabled")
+
+key_var = tk.IntVar(value=0)
+key_chk = ctk.CTkCheckBox(tag_content, text="Analyze & write Key tag",
+                           variable=key_var, command=toggle_key_format)
+key_chk.pack(anchor="w", pady=(6, 0))
+ToolTip(key_chk, "Detects musical key and writes TKEY tag to the output WAV.\nRequires: keyfinder-cli (falls back to aubio if not found)")
+
+key_row = ctk.CTkFrame(tag_content, fg_color="transparent")
+key_row.pack(fill="x", pady=(6, 0))
+ctk.CTkLabel(key_row, text="Key format:", width=90).pack(side="left", padx=(24, 8))
+key_format_menu = ctk.CTkOptionMenu(key_row, values=key_format_values,
+                                    variable=key_format_var, width=280, state="disabled")
+key_format_menu.pack(side="left")
+ToolTip(key_format_menu, "Key notation format written to the TKEY tag.")
+
+clean_var = tk.IntVar(value=0)
+clean_chk = ctk.CTkCheckBox(tag_content, text="Clean metadata", variable=clean_var)
+clean_chk.pack(anchor="w", pady=(6, 0))
+ToolTip(clean_chk,
+    "Triangulates Artist & Title from existing tags and filename.\n"
+    "Renames the output file to \u201cArtist \u2013 Title.wav\u201d and writes\n"
+    "Artist, Title, Album, and Track Number tags.")
+
 # --- Processing section ---
 proc_sec = ctk.CTkFrame(app, corner_radius=10)
 proc_sec.pack(fill="x", padx=20, pady=4)
@@ -269,27 +325,39 @@ force_chk = ctk.CTkCheckBox(proc_content, text="Force re-conversion", variable=f
 force_chk.pack(anchor="w")
 ToolTip(force_chk, "Re-convert all files even if valid output\nalready exists in the destination folder.")
 
+_cpu = os.cpu_count() or 4
+_worker_presets = [
+    ("4 workers", 4),
+    ("8 workers", 8),
+    (f"Half capacity  ({_cpu // 2})", max(_cpu // 2, 4)),
+    (f"Full capacity  ({_cpu})", max(_cpu, 4)),
+]
+_worker_labels = [lbl for lbl, _ in _worker_presets]
+_worker_map    = {lbl: cnt for lbl, cnt in _worker_presets}
+workers_var    = tk.StringVar(value=_worker_labels[0])
+
+def toggle_parallel():
+    workers_row.pack(fill="x", pady=(4, 0)) if parallel_var.get() == 1 else workers_row.pack_forget()
+
 parallel_var = tk.IntVar(value=0)
+parallel_chk = ctk.CTkCheckBox(proc_content, text="Parallel processing",
+                                variable=parallel_var, command=toggle_parallel)
+parallel_chk.pack(anchor="w", pady=(6, 0))
+ToolTip(parallel_chk, "Process multiple files simultaneously.\nFaster on multi-core machines.")
 
-# Build cores list: "Max (N)" + every number from max down to 2
-cores_values = [f"Max ({max_cores})"] + [str(n) for n in range(max_cores, 1, -1)]
-cores_var = tk.StringVar(value=cores_values[0])
+workers_row = ctk.CTkFrame(proc_content, fg_color="transparent")
+# workers_row is shown/hidden by toggle_parallel; hidden by default
+ctk.CTkLabel(workers_row, text="Workers:", width=90).pack(side="left", padx=(24, 8))
+workers_menu = ctk.CTkOptionMenu(workers_row, values=_worker_labels,
+                                  variable=workers_var, width=220)
+workers_menu.pack(side="left")
+ToolTip(workers_menu, "Total parallel workers. 1 is always\nreserved for the UI \u2014 the rest process files.")
 
-def toggle_cores():
-    cores_menu.configure(state="normal" if parallel_var.get() == 1 else "disabled")
-
-par_chk = ctk.CTkCheckBox(proc_content, text="Parallel processing",
-                            variable=parallel_var, command=toggle_cores)
-par_chk.pack(anchor="w", pady=(6, 0))
-ToolTip(par_chk, "Process multiple files simultaneously\nusing multiple CPU cores.")
-
-cores_row = ctk.CTkFrame(proc_content, fg_color="transparent")
-cores_row.pack(fill="x", pady=(6, 0))
-ctk.CTkLabel(cores_row, text="CPU Cores:", width=90).pack(side="left", padx=(24, 8))
-cores_menu = ctk.CTkOptionMenu(cores_row, values=cores_values,
-                                variable=cores_var, width=220, state="disabled")
-cores_menu.pack(side="left")
-ToolTip(cores_menu, "Number of CPU cores for parallel processing.\nMore cores = faster but heavier system load.")
+integrity_var = tk.IntVar(value=0)
+integrity_chk = ctk.CTkCheckBox(proc_content, text="Verify file integrity",
+                                 variable=integrity_var)
+integrity_chk.pack(anchor="w", pady=(6, 0))
+ToolTip(integrity_chk, "Compare output waveform against source:\nchecks duration, RMS level, clipping, and corrupt samples.")
 
 # --- Buttons ---
 btn_frame = ctk.CTkFrame(app, fg_color="transparent")
@@ -311,11 +379,7 @@ def on_start():
     force = "true" if force_var.get() == 1 else "false"
 
     if parallel_var.get() == 1:
-        cores_sel = cores_var.get()
-        if cores_sel.startswith("Max"):
-            jobs = str(max_cores)
-        else:
-            jobs = cores_sel
+        jobs = str(_worker_map[workers_var.get()])
     else:
         jobs = "1"
 
@@ -328,6 +392,11 @@ def on_start():
     print(f"TARGET_CODEC={codec}")
     print(f"FORCE_MODE={force}")
     print(f"PARALLEL_JOBS={jobs}")
+    print(f"ANALYZE_BPM={'true' if bpm_var.get() else 'false'}")
+    print(f"ANALYZE_KEY={'true' if key_var.get() else 'false'}")
+    print(f"KEY_FORMAT={key_format_var.get().split()[0].lower()}")
+    print(f"VERIFY_INTEGRITY={'true' if integrity_var.get() else 'false'}")
+    print(f"CLEAN_METADATA={'true' if clean_var.get() else 'false'}")
     app.destroy()
 
 def on_cancel():
@@ -358,7 +427,13 @@ PYTHON_GUI
       TARGET_BIT_DEPTH)    TARGET_BIT_DEPTH="$value" ;;
       TARGET_CODEC)        TARGET_CODEC="$value" ;;
       FORCE_MODE)          FORCE_MODE="$value" ;;
-      PARALLEL_JOBS)       PARALLEL_JOBS="$value" ;;
+      PARALLEL_JOBS)        PARALLEL_JOBS="$value" ;;
+      ANALYZE_BPM)          ANALYZE_BPM="$value" ;;
+      ANALYZE_KEY)          ANALYZE_KEY="$value" ;;
+      KEY_FORMAT)           KEY_FORMAT="$value" ;;
+      VERIFY_INTEGRITY)     VERIFY_INTEGRITY="$value" ;;
+      CLEAN_METADATA)       CLEAN_METADATA="$value" ;;
+      MAX_SILENCE_DURATION) ;; # deprecated, ignored
     esac
   done <<< "$gui_output"
 }
@@ -391,11 +466,791 @@ log() {
   fi
 }
 
+# --- Atomically flush per-file temp log into the main log ---
+# Uses flock on a .lock sidecar file so _flush_log and log() don't interleave.
+_flush_log() {
+  local tmp_log="$1" main_log="$2"
+  [ -n "$main_log" ] && [ -s "$tmp_log" ] && \
+    ( flock 9; cat "$tmp_log" >> "$main_log" ) 9>"${main_log}.lock"
+  rm -f "$tmp_log"
+}
+
+# --- Compute the clean destination filename from source tags + filename ---
+# Prints "{Artist} - {Title}.wav" (or "{Title}.wav" if no artist found).
+compute_clean_filename() {
+  local src="$1"
+  python3 - "$src" 2>/dev/null << 'PYCLEAN'
+import sys, os, re
+from pathlib import Path
+
+src = sys.argv[1]
+
+def ensure_mutagen():
+    try:
+        import mutagen
+    except ImportError:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "mutagen", "-q"],
+                       capture_output=True)
+
+def read_tags(path):
+    ensure_mutagen()
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(path, easy=True)
+        if not audio:
+            return {}
+        r = {}
+        for k in ('title', 'artist', 'album', 'tracknumber'):
+            v = audio.get(k)
+            if v:
+                r[k] = str(v[0]).strip()
+        return r
+    except Exception:
+        return {}
+
+def parse_fn(stem):
+    name = stem
+    r = {}
+    m = re.match(r'^[(\[]?(\d{1,3})[)\]]?[\s.\-_]+', name)
+    if m:
+        r['track_num'] = int(m.group(1))
+        name = name[m.end():].strip()
+    parts = re.split(r'\s+[-\u2013\u2014]\s+', name)
+    if len(parts) >= 2:
+        r['artist'] = parts[0].strip()
+        r['title'] = ' - '.join(parts[1:]).strip()
+    else:
+        r['title'] = name.strip()
+    return r
+
+def sanitize(s):
+    s = s.replace('/', '-').replace('\\', '-').replace(':', ' -')
+    s = re.sub(r'[<>"|?*\x00-\x1f]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+tags = read_tags(src)
+fn   = parse_fn(Path(src).stem)
+
+artist = (tags.get('artist') or fn.get('artist') or '').strip()
+title  = (tags.get('title')  or fn.get('title')  or Path(src).stem).strip()
+
+ca = sanitize(artist)
+ct = sanitize(title)
+
+if ca and ct:
+    print(f"{ca} - {ct}.wav")
+elif ct:
+    print(f"{ct}.wav")
+else:
+    print(Path(src).stem + ".wav")
+PYCLEAN
+}
+
+# --- Check whether an output WAV already has complete tags ---
+# Returns 0 (complete) or 1 (incomplete/missing).
+# Checks: TCON (genre, always required) + TXXX:Description (required when BPM or Key is on).
+_tags_complete() {
+  local wav="$1"
+  python3 - "$wav" "$ANALYZE_BPM" "$ANALYZE_KEY" "$CLEAN_METADATA" 2>/dev/null << 'PYTAGCHECK'
+import sys
+try:
+    from mutagen.wave import WAVE
+    audio = WAVE(sys.argv[1])
+    want_desc  = sys.argv[2].lower() == "true" or sys.argv[3].lower() == "true"
+    want_clean = sys.argv[4].lower() == "true" if len(sys.argv) > 4 else False
+    tags = audio.tags
+    if tags is None:
+        sys.exit(1)
+    tcon = tags.get("TCON")
+    if not tcon or not tcon.text[0].strip():
+        sys.exit(1)
+    if want_desc:
+        txxx = tags.get("TXXX:Description")
+        if not txxx or not txxx.text[0].strip():
+            sys.exit(1)
+    if want_clean:
+        tpe1 = tags.get("TPE1")
+        if not tpe1 or not tpe1.text[0].strip():
+            sys.exit(1)
+        tit2 = tags.get("TIT2")
+        if not tit2 or not tit2.text[0].strip():
+            sys.exit(1)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PYTAGCHECK
+}
+
+# --- Analyze output WAV: detect BPM and/or musical key, write ID3 tags ---
+analyze_and_tag() {
+  local file="$1"      # output WAV
+  local src_file="$2"  # original source file (for metadata triangulation)
+  python3 - "$file" "$ANALYZE_BPM" "$ANALYZE_KEY" "$KEY_FORMAT" "$SOURCE_DIR" "${src_file:-}" "$CLEAN_METADATA" << 'PYEOF'
+import sys
+import subprocess
+import os
+import re
+from pathlib import Path
+
+file      = sys.argv[1]
+do_bpm    = sys.argv[2].lower() == "true"
+do_key    = sys.argv[3].lower() == "true"
+key_fmt   = sys.argv[4].lower()
+src_dir   = sys.argv[5] if len(sys.argv) > 5 else ""
+src_file  = sys.argv[6] if len(sys.argv) > 6 else ""
+do_clean  = sys.argv[7].lower() == "true" if len(sys.argv) > 7 else False
+
+# Genre = immediate parent folder of the file, always
+genre = os.path.basename(os.path.dirname(file)) or None
+
+def ensure_pkg(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"],
+                       capture_output=True)
+
+if do_bpm or do_key or genre or do_clean:
+    ensure_pkg("mutagen")
+
+bpm_val     = None
+key_val     = None
+standard_key = None
+
+# --- BPM detection via aubio ---
+if do_bpm:
+    try:
+        ensure_pkg("aubio")
+        import aubio
+        import statistics
+        win_s = 1024
+        hop_s = 512
+        src = aubio.source(file, 0, hop_s)
+        samplerate = src.samplerate
+        tempo = aubio.tempo("default", win_s, hop_s, samplerate)
+        beats = []
+        while True:
+            samples, read = src()
+            if tempo(samples):
+                beats.append(tempo.get_bpm())
+            if read < hop_s:
+                break
+        if beats:
+            bpm_val = round(statistics.median(beats))
+            print(f"INFO: BPM detected: {bpm_val}")
+        else:
+            print("WARN: BPM detection returned no beats")
+    except Exception as e:
+        print(f"WARN: BPM detection failed: {e}")
+
+# --- Key detection: keyfinder-cli first, aubio fallback ---
+if do_key:
+    try:
+        result = subprocess.run(
+            ["keyfinder-cli", file],
+            capture_output=True, text=True, timeout=60
+        )
+        raw_key = result.stdout.strip()
+        if not raw_key:
+            raise ValueError("keyfinder-cli returned empty output")
+        standard_key = raw_key
+        print(f"INFO: Key detected (keyfinder-cli): {standard_key}")
+    except FileNotFoundError:
+        print("WARN: keyfinder-cli not found, falling back to aubio key detection")
+        try:
+            ensure_pkg("aubio")
+            import aubio
+            win_s = 4096
+            hop_s = 512
+            src = aubio.source(file, 0, hop_s)
+            samplerate = src.samplerate
+            pitch_o = aubio.pitch("yin", win_s, hop_s, samplerate)
+            pitch_hist = [0.0] * 12
+            while True:
+                samples, read = src()
+                p = pitch_o(samples)[0]
+                if p > 0:
+                    pitch_hist[int(round(p)) % 12] += 1
+                if read < hop_s:
+                    break
+            major_p = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88]
+            minor_p = [6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
+            notes   = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+            total   = sum(pitch_hist) or 1
+            norm    = [x / total for x in pitch_hist]
+            best_corr = -1
+            for root in range(12):
+                for profile, suffix in [(major_p, ""), (minor_p, "m")]:
+                    rot  = profile[root:] + profile[:root]
+                    corr = sum(a * b for a, b in zip(norm, rot))
+                    if corr > best_corr:
+                        best_corr = corr
+                        standard_key = notes[root] + suffix
+            print(f"INFO: Key detected (aubio fallback): {standard_key}")
+        except Exception as e:
+            print(f"WARN: Key detection failed: {e}")
+    except Exception as e:
+        print(f"WARN: Key detection failed: {e}")
+
+    if standard_key:
+        std_to_camelot = {
+            "C":"8B","G":"9B","D":"10B","A":"11B","E":"12B","B":"1B",
+            "F#":"2B","C#":"3B","G#":"4B","D#":"5B","A#":"6B","F":"7B",
+            "Am":"8A","Em":"9A","Bm":"10A","F#m":"11A","C#m":"12A",
+            "G#m":"1A","D#m":"2A","A#m":"3A","Fm":"4A","Cm":"5A",
+            "Gm":"6A","Dm":"7A",
+        }
+        std_to_openkey = {
+            "C":"1d","G":"2d","D":"3d","A":"4d","E":"5d","B":"6d",
+            "F#":"7d","C#":"8d","G#":"9d","D#":"10d","A#":"11d","F":"12d",
+            "Am":"1m","Em":"2m","Bm":"3m","F#m":"4m","C#m":"5m",
+            "G#m":"6m","D#m":"7m","A#m":"8m","Fm":"9m","Cm":"10m",
+            "Gm":"11m","Dm":"12m",
+        }
+        if key_fmt == "camelot":
+            key_val = std_to_camelot.get(standard_key, standard_key)
+        elif key_fmt == "openkey":
+            key_val = std_to_openkey.get(standard_key, standard_key)
+        else:
+            key_val = standard_key
+
+# --- Helpers for clean metadata ---
+def _read_src_tags(path):
+    """Read easy-mode tags from any mutagen-supported format."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(path, easy=True)
+        if not audio:
+            return {}
+        r = {}
+        for k in ('title', 'artist', 'album', 'tracknumber'):
+            v = audio.get(k)
+            if v:
+                r[k] = str(v[0]).strip()
+        return r
+    except Exception:
+        return {}
+
+def _parse_fn(stem):
+    """Parse artist, title, optional track_num from a filename stem."""
+    name = stem
+    r = {}
+    m = re.match(r'^[(\[]?(\d{1,3})[)\]]?[\s.\-_]+', name)
+    if m:
+        r['track_num'] = int(m.group(1))
+        name = name[m.end():].strip()
+    parts = re.split(r'\s+[-\u2013\u2014]\s+', name)
+    if len(parts) >= 2:
+        r['artist'] = parts[0].strip()
+        r['title']  = ' - '.join(parts[1:]).strip()
+    else:
+        r['title'] = name.strip()
+    return r
+
+# --- Write ID3 tags to WAV ---
+if bpm_val is not None or key_val is not None or genre is not None or do_clean:
+    try:
+        from mutagen.wave import WAVE
+        from mutagen.id3 import TBPM, TKEY, TXXX, TCON, TPE1, TIT2, TALB, TRCK
+        audio = WAVE(file)
+        if audio.tags is None:
+            audio.add_tags()
+        if bpm_val is not None:
+            audio.tags.add(TBPM(encoding=3, text=[str(bpm_val)]))
+        if key_val is not None:
+            audio.tags.add(TKEY(encoding=3, text=[key_val]))
+        # Build Description field (TXXX:Description — shows as "Description" in MediaInfo/Nemo)
+        desc_parts = []
+        if bpm_val is not None:
+            desc_parts.append(f"BPM: {bpm_val}")
+        if key_val is not None:
+            desc_parts.append(f"Key: {key_val}")
+        if desc_parts:
+            desc_text = " | ".join(desc_parts)
+            audio.tags.add(TXXX(encoding=3, desc="Description", text=[desc_text]))
+        # Write genre from immediate parent folder
+        if genre:
+            audio.tags.add(TCON(encoding=3, text=[genre]))
+        # --- Clean metadata: triangulate Artist/Title/Album/Track ---
+        if do_clean:
+            src_tags = _read_src_tags(src_file)
+            fn_info  = _parse_fn(Path(src_file).stem) if src_file else {}
+            artist = (src_tags.get('artist') or fn_info.get('artist') or '').strip()
+            title  = (src_tags.get('title')  or fn_info.get('title')  or '').strip()
+            album  = src_tags.get('album', '').strip()
+            # Track number: prefer source tag (handles "1/12" format), fall back to filename
+            trk_raw = src_tags.get('tracknumber', '')
+            if trk_raw:
+                try:
+                    track_num = str(int(trk_raw.split('/')[0].strip()))
+                except Exception:
+                    track_num = str(fn_info['track_num']) if fn_info.get('track_num') else ''
+            else:
+                track_num = str(fn_info['track_num']) if fn_info.get('track_num') else ''
+            if artist:
+                audio.tags.add(TPE1(encoding=3, text=[artist]))
+            if title:
+                audio.tags.add(TIT2(encoding=3, text=[title]))
+            if album:
+                audio.tags.add(TALB(encoding=3, text=[album]))
+            if track_num:
+                audio.tags.add(TRCK(encoding=3, text=[track_num]))
+            info_parts = []
+            if artist:    info_parts.append(f"artist={artist!r}")
+            if title:     info_parts.append(f"title={title!r}")
+            if album:     info_parts.append(f"album={album!r}")
+            if track_num: info_parts.append(f"track={track_num!r}")
+            print(f"INFO: Metadata cleaned: {', '.join(info_parts)}")
+        audio.save()
+        print(f"INFO: Tags written to {os.path.basename(file)}")
+    except Exception as e:
+        print(f"ERROR: Failed to write tags: {e}")
+PYEOF
+}
+
+# --- Verify output WAV: compare waveform stats between source and output ---
+# Uses astats on both files so we directly compare the two waveforms.
+verify_integrity() {
+  local src_file="$1"
+  local out_file="$2"
+
+  # ── 1. Duration integrity ─────────────────────────────────────────────────
+  local src_dur out_dur
+  src_dur=$(ffprobe -v error -show_entries format=duration \
+    -of csv=p=0 "$src_file" 2>/dev/null || echo "")
+  out_dur=$(ffprobe -v error -show_entries format=duration \
+    -of csv=p=0 "$out_file" 2>/dev/null || echo "")
+
+  if [ -n "$src_dur" ] && [ -n "$out_dur" ]; then
+    local diff_int
+    diff_int=$(awk -v s="$src_dur" -v o="$out_dur" \
+      'BEGIN{d=s-o; if(d<0)d=-d; printf "%d", d+0.5}')
+    if [ "$diff_int" -gt 2 ]; then
+      echo "WARN: Duration mismatch: source=${src_dur}s output=${out_dur}s (diff=${diff_int}s)"
+    fi
+  fi
+
+  # ── 2. Waveform comparison via astats on source and output ─────────────────
+  # Run astats + volumedetect on source
+  local src_analysis
+  src_analysis=$(ffmpeg -i "$src_file" \
+    -af "astats,volumedetect" \
+    -f null /dev/null 2>&1 || true)
+  # Run astats + volumedetect on output (single pass)
+  local out_analysis
+  out_analysis=$(ffmpeg -i "$out_file" \
+    -af "astats,volumedetect" \
+    -f null /dev/null 2>&1 || true)
+
+  # Extract RMS levels from both (astats reports "RMS level dB")
+  local rms_src rms_out
+  rms_src=$(echo "$src_analysis" | grep -oP 'RMS level dB:\s*\K[-0-9.]+' | head -1 || echo "")
+  rms_out=$(echo "$out_analysis" | grep -oP 'RMS level dB:\s*\K[-0-9.]+' | head -1 || echo "")
+
+  # Warn if RMS difference between source and output exceeds 3 dB
+  # (accounts for loudness normalisation which intentionally changes levels,
+  #  but a larger gap may indicate a processing error)
+  if [ -n "$rms_src" ] && [ -n "$rms_out" ]; then
+    local rms_diff_int
+    rms_diff_int=$(awk -v s="$rms_src" -v o="$rms_out" \
+      'BEGIN{d=o-s; if(d<0)d=-d; printf "%d", d+0.5}')
+    if [ "$rms_diff_int" -gt 15 ]; then
+      echo "WARN: Large RMS level difference between source and output (${rms_src} dB → ${rms_out} dB, diff=${rms_diff_int} dB) — possible encoding issue"
+    fi
+  fi
+
+  # ── 3. Near-silence / clipping (volumedetect) ────────────────────────────
+  local max_vol mean_vol
+  max_vol=$(echo "$out_analysis" | grep -oP 'max_volume: \K[-0-9.]+' | head -1 || echo "")
+  mean_vol=$(echo "$out_analysis" | grep -oP 'mean_volume: \K[-0-9.]+' | head -1 || echo "")
+
+  # Mean ≤ -50 dBFS → output is essentially mute (encoding failure)
+  if [ -n "$mean_vol" ]; then
+    local is_mute
+    is_mute=$(awk -v v="$mean_vol" 'BEGIN{printf "%d", v <= -50}')
+    if [ "$is_mute" = "1" ]; then
+      echo "WARN: Output appears near-silent (mean: ${mean_vol} dBFS) — possible mute or encoding failure"
+    fi
+  fi
+
+  # Max ≥ -0.1 dBFS → possible clipping
+  if [ -n "$max_vol" ]; then
+    local is_clip
+    is_clip=$(awk -v v="$max_vol" 'BEGIN{printf "%d", v >= -0.1}')
+    if [ "$is_clip" = "1" ]; then
+      local clipped_n
+      clipped_n=$(echo "$out_analysis" | grep -oP 'histogram_0db: \K[0-9]+' | head -1 || echo "?")
+      echo "WARN: Possible clipping in output (max: ${max_vol} dBFS; samples at 0dBFS: ${clipped_n})"
+    fi
+  fi
+
+  # ── 4. Corrupt samples: NaN / Inf (astats) ───────────────────────────────
+  # Sum across all channels (stereo = two lines per metric)
+  local nan_n inf_n
+  nan_n=$(echo "$out_analysis" | grep -oP 'Number of NaNs:\s*\K[0-9]+' | \
+    awk '{s+=$1} END{print s+0}' || echo "0")
+  inf_n=$(echo "$out_analysis"  | grep -oP 'Number of Infs:\s*\K[0-9]+' | \
+    awk '{s+=$1} END{print s+0}' || echo "0")
+  [ -z "$nan_n" ] && nan_n=0
+  [ -z "$inf_n" ] && inf_n=0
+  if [ "$nan_n" -gt 0 ]; then
+    echo "ERROR: Output contains ${nan_n} NaN sample(s) — file may be corrupt"
+  fi
+  if [ "$inf_n" -gt 0 ]; then
+    echo "ERROR: Output contains ${inf_n} Inf sample(s) — file may be corrupt"
+  fi
+
+  # DC offset > 5% of full scale → audible hum risk
+  local dc_off
+  dc_off=$(echo "$out_analysis" | grep -oP 'DC offset:\s*\K[-0-9.e+]+' | head -1 || echo "")
+  if [ -n "$dc_off" ]; then
+    local dc_warn
+    dc_warn=$(awk -v d="$dc_off" 'BEGIN{if(d<0)d=-d; printf "%d", d > 0.05}')
+    if [ "$dc_warn" = "1" ]; then
+      echo "WARN: Significant DC offset in output: ${dc_off} (>5% of full scale)"
+    fi
+  fi
+
+  # ── 5. File-size sanity: WAV must be ≥ 50% of expected uncompressed size ──
+  if [ -n "$out_dur" ] && [ -f "$out_file" ]; then
+    local file_bytes expected_min
+    file_bytes=$(stat -c%s "$out_file" 2>/dev/null || echo 0)
+    expected_min=$(awk -v d="$out_dur" -v sr="$TARGET_SAMPLE_RATE" \
+      -v ch="$TARGET_CHANNELS" -v bd="$TARGET_BIT_DEPTH" \
+      'BEGIN{printf "%d", d * sr * ch * (bd/8) * 0.5}')
+    if [ "$file_bytes" -lt "$expected_min" ]; then
+      echo "WARN: File is suspiciously small (${file_bytes} bytes) for ${out_dur}s audio — minimum expected: ${expected_min} bytes"
+    fi
+  fi
+
+  return 0
+}
+
+# --- GUI progress window (shown during conversion) ---
+# Launched after file discovery; communicates via a FIFO.
+# Falls back silently when no display or customtkinter is available.
+launch_progress_window() {
+  local total_files="$1"
+  local parallel_jobs="$2"
+
+  [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && return
+  python3 -c "import customtkinter" 2>/dev/null || return
+
+  PROGRESS_FIFO=$(mktemp -u /tmp/mc_progress_XXXXXX)
+  PROGRESS_SCRIPT=$(mktemp /tmp/mc_pgui_XXXXXX.py)
+  mkfifo "$PROGRESS_FIFO" || { PROGRESS_FIFO="" PROGRESS_SCRIPT=""; return; }
+
+  cat > "$PROGRESS_SCRIPT" << 'PROGRESS_GUI'
+import sys, os, threading, queue
+try:
+    import customtkinter as ctk
+    import tkinter as tk
+except ImportError:
+    sys.exit(0)
+
+total        = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+jobs         = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+file_workers = max(jobs - 1, 1)  # 1 worker is reserved for this UI process
+
+STEPS     = [("measuring","Measure"),("converting","Convert"),
+             ("validating","Validate"),("tagging","Tag"),("integrity","Integrity")]
+STEP_KEYS = [k for k,_ in STEPS]
+C_PENDING = "gray40"
+C_ACTIVE  = "#60A5FA"
+C_DONE    = "#4ADE80"
+C_FAIL    = "#F87171"
+C_SEP     = "gray35"
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+try:
+    app = ctk.CTk()
+except Exception:
+    sys.exit(0)
+
+app.title("\u266b Music Converter \u2014 Converting\u2026")
+screen_h = app.winfo_screenheight()
+ui_scale = max(1.0, screen_h / 1080)
+ctk.set_widget_scaling(ui_scale)
+
+F_TITLE = ctk.CTkFont(size=22, weight="bold")
+F_SUB   = ctk.CTkFont(size=12)
+F_SEC   = ctk.CTkFont(size=13, weight="bold")
+F_CARD  = ctk.CTkFont(size=12, weight="bold")
+F_STEP  = ctk.CTkFont(size=11)
+F_LOG   = ctk.CTkFont(size=11)
+
+CARD_H = 82
+win_w  = 640
+win_h  = min(920, 240 + max(file_workers, 1) * (CARD_H + 8) + 185)
+app.geometry(f"{int(win_w * ui_scale)}x{int(win_h * ui_scale)}")
+app.resizable(False, True)
+
+scroll = ctk.CTkScrollableFrame(app, fg_color="transparent")
+scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
+# Header
+hdr = ctk.CTkFrame(scroll, fg_color="transparent")
+hdr.pack(fill="x", padx=24, pady=(20, 0))
+title_lbl = ctk.CTkLabel(hdr, text="\u266b Music Converter", font=F_TITLE)
+title_lbl.pack(anchor="w")
+suffix = f"  \u00b7  {file_workers} processing + 1 UI" if jobs > 1 else ""
+sub_lbl = ctk.CTkLabel(hdr,
+    text=f"Converting {total} file{'s' if total != 1 else ''}{suffix}\u2026",
+    font=F_SUB, text_color="gray55")
+sub_lbl.pack(anchor="w", pady=(4, 0))
+
+# Overall progress
+prog_sec = ctk.CTkFrame(scroll, corner_radius=10)
+prog_sec.pack(fill="x", padx=20, pady=(16, 4))
+ctk.CTkLabel(prog_sec, text="Overall Progress", font=F_SEC).pack(anchor="w", padx=14, pady=(12, 4))
+pg = ctk.CTkFrame(prog_sec, fg_color="transparent")
+pg.pack(fill="x", padx=14, pady=(0, 12))
+prog_bar = ctk.CTkProgressBar(pg, height=18)
+prog_bar.set(0)
+prog_bar.pack(fill="x", pady=(0, 6))
+stats_lbl = ctk.CTkLabel(pg, text=f"0 / {total}", font=F_SUB, text_color="gray55")
+stats_lbl.pack(anchor="w")
+
+# Worker cards — one per parallel job
+workers_sec = ctk.CTkFrame(scroll, corner_radius=10)
+workers_sec.pack(fill="x", padx=20, pady=4)
+ctk.CTkLabel(workers_sec,
+    text="Workers" if file_workers > 1 else "Progress",
+    font=F_SEC).pack(anchor="w", padx=14, pady=(12, 6))
+
+slots = []
+for _ in range(max(file_workers, 1)):
+    card = ctk.CTkFrame(workers_sec, corner_radius=8, fg_color=("#1e1e1e","#1e1e1e"))
+    card.pack(fill="x", padx=10, pady=(0, 6))
+    r1 = ctk.CTkFrame(card, fg_color="transparent")
+    r1.pack(fill="x", padx=10, pady=(8, 2))
+    icon_lbl = ctk.CTkLabel(r1, text="\u2014", font=F_CARD, text_color="gray55", width=20)
+    icon_lbl.pack(side="left")
+    name_lbl = ctk.CTkLabel(r1, text="\u2014", font=F_CARD, text_color="gray55", anchor="w")
+    name_lbl.pack(side="left", padx=(6, 0), fill="x", expand=True)
+    r2 = ctk.CTkFrame(card, fg_color="transparent")
+    r2.pack(fill="x", padx=10, pady=(0, 2))
+    step_lbls = {}
+    for si, (skey, sname) in enumerate(STEPS):
+        lbl = ctk.CTkLabel(r2, text=sname, font=F_STEP, text_color=C_PENDING)
+        lbl.pack(side="left")
+        step_lbls[skey] = lbl
+        if si < len(STEPS) - 1:
+            ctk.CTkLabel(r2, text=" \u2192 ", font=F_STEP, text_color=C_SEP).pack(side="left")
+    r3 = ctk.CTkFrame(card, fg_color="transparent")
+    r3.pack(fill="x", padx=10, pady=(2, 8))
+    prog = ctk.CTkProgressBar(r3, height=6, mode="indeterminate", indeterminate_speed=0.8)
+    prog.pack(fill="x")
+    prog.set(0)
+    slots.append({"file": None, "icon": icon_lbl, "name": name_lbl,
+                  "steps": step_lbls, "cur": None, "done": set(), "failed": False,
+                  "bar": prog})
+
+def _slot_for(path):
+    for s in slots:
+        if s["file"] == path:
+            return s
+    return None
+
+def _free_slot():
+    for s in slots:
+        if s["file"] is None:
+            return s
+    return slots[0]
+
+def _refresh(s):
+    if s["file"] is None:
+        s["icon"].configure(text="\u2014", text_color="gray55")
+        s["name"].configure(text="\u2014", text_color="gray55")
+        for lbl in s["steps"].values():
+            lbl.configure(text_color=C_PENDING, font=F_STEP)
+        return
+    if s["failed"]:
+        s["icon"].configure(text="\u2717", text_color=C_FAIL)
+    elif s["cur"]:
+        s["icon"].configure(text="\u25b6", text_color=C_ACTIVE)
+    else:
+        s["icon"].configure(text="\u2713", text_color=C_DONE)
+    s["name"].configure(text_color="white")
+    for skey, lbl in s["steps"].items():
+        if skey == s["cur"]:
+            lbl.configure(text_color=C_ACTIVE, font=ctk.CTkFont(size=11, weight="bold"))
+        elif skey in s["done"]:
+            lbl.configure(text_color=C_DONE, font=F_STEP)
+        else:
+            lbl.configure(text_color=C_PENDING, font=F_STEP)
+
+# Recent activity log
+log_sec = ctk.CTkFrame(scroll, corner_radius=10)
+log_sec.pack(fill="x", padx=20, pady=4)
+ctk.CTkLabel(log_sec, text="Recent Activity", font=F_SEC).pack(anchor="w", padx=14, pady=(12, 4))
+log_box = ctk.CTkTextbox(log_sec, height=110, font=F_LOG, state="disabled")
+log_box.pack(fill="x", padx=14, pady=(0, 12))
+
+# Close button (enabled when done)
+btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+btn_row.pack(fill="x", padx=20, pady=(4, 18))
+close_btn = ctk.CTkButton(btn_row, text="Close", width=120, command=app.destroy, state="disabled")
+close_btn.pack(side="right")
+
+# State & IPC
+done = conv = fail = skip = 0
+finished = False
+eq = queue.Queue()
+
+def _reader():
+    try:
+        for line in sys.stdin:
+            eq.put(line.rstrip())
+    except Exception:
+        pass
+    eq.put("__EOF__")
+
+threading.Thread(target=_reader, daemon=True).start()
+
+ICONS = {"converted": "\u2713", "failed": "\u2717", "skipped": "\u25a0"}
+
+def _log(text):
+    log_box.configure(state="normal")
+    log_box.insert("end", text + "\n")
+    log_box.see("end")
+    log_box.configure(state="disabled")
+
+def _on_start(path):
+    s = _slot_for(path)
+    if s is None:
+        s = _free_slot()
+        s["file"] = path
+        s["cur"] = None
+        s["done"] = set()
+        s["failed"] = False
+        s["name"].configure(text=os.path.basename(path))
+        s["bar"].set(0.0)
+    _refresh(s)
+
+def _on_step(path, step):
+    s = _slot_for(path)
+    if s is None:
+        return
+    if s["cur"] in STEP_KEYS:
+        s["done"].add(s["cur"])
+    s["cur"] = step
+    _refresh(s)
+    s["bar"].stop()
+    s["bar"].start()
+
+def _on_done(path, status):
+    global done, conv, fail, skip
+    done += 1
+    if status == "converted": conv += 1
+    elif status == "failed":  fail += 1
+    elif status == "skipped": skip += 1
+    s = _slot_for(path)
+    if s:
+        if s["cur"]:
+            if status == "converted":
+                s["done"].add(s["cur"])
+            elif status == "failed":
+                s["failed"] = True
+        s["cur"] = None
+        _refresh(s)
+        s["bar"].stop()
+        s["bar"].set(1.0 if status == "converted" else 0.0)
+        app.after(1500, lambda sv=s, fv=path: _clear(sv, fv))
+    prog_bar.set(done / total if total else 1)
+    stats_lbl.configure(text=f"{done} / {total} files  \u2014  "
+        f"\u2713\u202f{conv}  \u2717\u202f{fail}  \u25a0\u202f{skip}")
+    icon = ICONS.get(status, "?")
+    _log(f"  {icon}  {os.path.basename(path)}  ({status})")
+
+def _clear(s, path):
+    if s["file"] == path:
+        s["file"] = None
+        _refresh(s)
+        s["bar"].set(0.0)
+
+def _on_finish():
+    global finished
+    finished = True
+    prog_bar.set(1.0)
+    title_lbl.configure(text="\u266b Music Converter \u2014 Done!")
+    sub_lbl.configure(text=f"Completed  \u2014  "
+        f"\u2713\u202f{conv} converted   \u2717\u202f{fail} failed   \u25a0\u202f{skip} skipped")
+    for s in slots:
+        s["file"] = None
+        s["bar"].stop()
+        s["bar"].set(0.0)
+        _refresh(s)
+    _log(f"\n  All done: {conv} converted, {fail} failed, {skip} skipped.")
+    close_btn.configure(state="normal")
+    app.title("\u266b Music Converter \u2014 Done!")
+
+def _poll():
+    try:
+        while True:
+            msg = eq.get_nowait()
+            if msg == "__EOF__":
+                if not finished:
+                    _on_finish()
+                return
+            elif msg.startswith("FILE_START:"):
+                _on_start(msg[11:])
+            elif msg.startswith("FILE_STEP:"):
+                body = msg[10:]
+                colon = body.rfind(":")
+                if colon > 0:
+                    _on_step(body[:colon], body[colon + 1:])
+            elif msg.startswith("FILE_DONE:"):
+                body = msg[10:]
+                colon = body.rfind(":")
+                if colon > 0:
+                    _on_done(body[:colon], body[colon + 1:])
+            elif msg.startswith("DONE:") and not finished:
+                _on_finish()
+    except queue.Empty:
+        pass
+    app.after(150, _poll)
+
+app.after(150, _poll)
+app.protocol("WM_DELETE_WINDOW", app.destroy)
+app.mainloop()
+PROGRESS_GUI
+
+  # Open FIFO O_RDWR so it stays "connected" without blocking
+  exec 8<>"$PROGRESS_FIFO"
+  # Launch progress window; its stdin reads from the FIFO
+  python3 "$PROGRESS_SCRIPT" "$total_files" "$parallel_jobs" < "$PROGRESS_FIFO" &
+  PROGRESS_PID=$!
+}
+
+send_progress_event() {
+  [ -n "$PROGRESS_FIFO" ] || return 0
+  echo "$1" >&8 2>/dev/null || true
+}
+
+close_progress_window() {
+  [ -n "$PROGRESS_FIFO" ] || return 0
+  send_progress_event "DONE:"
+  exec 8>&-  # Close write end → Python stdin sees EOF → window auto-closes
+  [ -n "$PROGRESS_PID" ] && wait "$PROGRESS_PID" 2>/dev/null || true
+  rm -f "$PROGRESS_FIFO" "$PROGRESS_SCRIPT"
+  PROGRESS_FIFO="" PROGRESS_PID="" PROGRESS_SCRIPT=""
+}
+
 update_progress_bar() {
   local processed_files="$1"
   local total_files="$2"
   local color="$3"
   local current_file="$4"
+
+  # GUI progress window is active — no terminal output needed
+  [ -n "$PROGRESS_FIFO" ] && return
 
   local percentage=$((processed_files * 100 / total_files))
   local progress_bar_length=50
@@ -488,6 +1343,22 @@ process_file() {
   local LOG_FILE="$4"
   local FORCE_MODE="$5"
 
+  # Per-file temp log — buffered so the whole block flushes atomically (no parallel interleaving)
+  local tmp_log
+  tmp_log=$(mktemp /tmp/mc_XXXXXX.log)
+
+  # plog: write timestamped line to tmp_log; echo errors/forced lines to stderr immediately
+  plog() {
+    local msg="$1" lvl="$2" col="$3" console="$4"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ${lvl} - ${msg}" >> "$tmp_log"
+    if [ "$lvl" = "ERROR" ] || [ "$console" = "force" ]; then
+      echo -e "${col}${lvl}: ${msg}${C_NC}" >&2
+    fi
+  }
+
+  # Notify progress window that this file has started
+  send_progress_event "FILE_START:$file"
+
   # --- Determine destination path (always .wav) ---
   local rel_path="${file#$SOURCE_DIR/}"
   local dest_file_wav="$DEST_DIR/${rel_path%.*}.wav"
@@ -495,21 +1366,52 @@ process_file() {
   dest_dir=$(dirname "$dest_file_wav")
   mkdir -p "$dest_dir" >/dev/null 2>&1
 
+  # If clean metadata is on, rename destination to "{Artist} - {Title}.wav"
+  if [ "$CLEAN_METADATA" = "true" ]; then
+    local clean_name
+    clean_name=$(compute_clean_filename "$file")
+    if [ -n "$clean_name" ]; then
+      dest_file_wav="$dest_dir/$clean_name"
+    fi
+  fi
+
   # --- Skip logic: if destination exists, is valid, and not in force mode ---
   if [ "$FORCE_MODE" != "true" ] && [ -f "$dest_file_wav" ]; then
     if validate_output "$dest_file_wav" >/dev/null 2>&1; then
-      log "Output file '$dest_file_wav' already exists and is valid, skipping..." "WARN" "$C_YELLOW"
-      echo "skipped"
-      return
+      if _tags_complete "$dest_file_wav"; then
+        plog "Skipping '$(basename "$dest_file_wav")': already valid with complete tags" "INFO" "$C_YELLOW"
+        _flush_log "$tmp_log" "$LOG_FILE"
+        send_progress_event "FILE_DONE:$file:skipped"
+        echo "skipped"
+        return
+      else
+        plog "Output exists but tags incomplete, re-tagging: $(basename "$dest_file_wav")" "WARN" "$C_YELLOW"
+        send_progress_event "FILE_STEP:$file:tagging"
+        while IFS= read -r tag_line; do
+          local ta_lvl="${tag_line%%:*}"
+          local ta_msg="${tag_line#*: }"
+          local ta_col="$C_BLUE"
+          [ "$ta_lvl" = "WARN" ]  && ta_col="$C_YELLOW"
+          [ "$ta_lvl" = "ERROR" ] && ta_col="$C_RED"
+          plog "$ta_msg" "$ta_lvl" "$ta_col"
+        done < <(analyze_and_tag "$dest_file_wav" "$file" 2>/dev/null)
+        _flush_log "$tmp_log" "$LOG_FILE"
+        send_progress_event "FILE_DONE:$file:converted"
+        echo "converted"
+        return
+      fi
     else
-      log "Output file '$dest_file_wav' exists but is invalid, re-converting..." "WARN" "$C_YELLOW"
+      plog "Output file '$dest_file_wav' exists but is invalid, re-converting..." "WARN" "$C_YELLOW"
     fi
   fi
 
   # --- Pass 1: Measure loudness ---
+  send_progress_event "FILE_STEP:$file:measuring"
   local measured_values
   if ! measured_values=$(measure_loudness "$file"); then
-    log "Loudness measurement failed for $file, skipping" "ERROR" "$C_RED"
+    plog "Loudness measurement failed for $file, skipping" "ERROR" "$C_RED"
+    _flush_log "$tmp_log" "$LOG_FILE"
+    send_progress_event "FILE_DONE:$file:failed"
     echo "failed"
     return
   fi
@@ -517,9 +1419,10 @@ process_file() {
   local input_i input_tp input_lra input_thresh target_offset
   IFS=':' read -r input_i input_tp input_lra input_thresh target_offset <<< "$measured_values"
 
-  log "Measured loudness for $(basename "$file"): I=${input_i} LUFS, TP=${input_tp} dBTP" "INFO" "$C_BLUE"
+  plog "Measured loudness for $(basename "$file"): I=${input_i} LUFS, TP=${input_tp} dBTP" "INFO" "$C_BLUE"
 
   # --- Pass 2: Convert with normalization ---
+  send_progress_event "FILE_STEP:$file:converting"
   local loudnorm_filter="loudnorm=I=${TARGET_LUFS}:TP=${TARGET_TP}:LRA=11:measured_I=${input_i}:measured_TP=${input_tp}:measured_LRA=${input_lra}:measured_thresh=${input_thresh}:offset=${target_offset}:linear=true"
 
   local ffmpeg_output
@@ -529,19 +1432,49 @@ process_file() {
   fi
   if ffmpeg_output=$(ffmpeg -i "$file" -af "$loudnorm_filter" -ar "$TARGET_SAMPLE_RATE" -sample_fmt "$sample_fmt" -ac "$TARGET_CHANNELS" -c:a "$TARGET_CODEC" -y "$dest_file_wav" 2>&1); then
     touch -r "$file" "$dest_file_wav" >/dev/null 2>&1
-    # Validate the output
+    send_progress_event "FILE_STEP:$file:validating"
     if validate_output "$dest_file_wav"; then
-      log "Converted $file to $dest_file_wav" "INFO" "$C_GREEN"
+      plog "Converted $file to $dest_file_wav" "INFO" "$C_GREEN"
+
+      # --- Tagging (genre always; BPM/Key when enabled) ---
+      send_progress_event "FILE_STEP:$file:tagging"
+      while IFS= read -r tag_line; do
+        local ta_lvl="${tag_line%%:*}"
+        local ta_msg="${tag_line#*: }"
+        local ta_col="$C_BLUE"
+        [ "$ta_lvl" = "WARN" ]  && ta_col="$C_YELLOW"
+        [ "$ta_lvl" = "ERROR" ] && ta_col="$C_RED"
+        plog "$ta_msg" "$ta_lvl" "$ta_col"
+      done < <(analyze_and_tag "$dest_file_wav" "$file" 2>/dev/null)
+
+      # --- Integrity verification ---
+      if [ "$VERIFY_INTEGRITY" = "true" ]; then
+        send_progress_event "FILE_STEP:$file:integrity"
+        while IFS= read -r vi_line; do
+          local vi_lvl="${vi_line%%:*}"
+          local vi_msg="${vi_line#*: }"
+          local vi_col="$C_YELLOW"
+          [ "$vi_lvl" = "ERROR" ] && vi_col="$C_RED"
+          plog "$vi_msg" "$vi_lvl" "$vi_col"
+        done < <(verify_integrity "$file" "$dest_file_wav" 2>/dev/null)
+      fi
+
+      _flush_log "$tmp_log" "$LOG_FILE"
+      send_progress_event "FILE_DONE:$file:converted"
       echo "converted"
     else
-      log "Converted $file but validation failed, deleting bad output" "ERROR" "$C_RED"
+      plog "Converted $file but validation failed, deleting bad output" "ERROR" "$C_RED"
       rm -f "$dest_file_wav"
+      _flush_log "$tmp_log" "$LOG_FILE"
+      send_progress_event "FILE_DONE:$file:failed"
       echo "failed"
     fi
   else
-    log "Failed to convert $file to $dest_file_wav" "ERROR" "$C_RED"
-    log "ffmpeg output:\n$ffmpeg_output" "ERROR" "$C_RED"
+    plog "Failed to convert $file to $dest_file_wav" "ERROR" "$C_RED"
+    plog "ffmpeg output:\n$ffmpeg_output" "ERROR" "$C_RED"
     rm -f "$dest_file_wav"
+    _flush_log "$tmp_log" "$LOG_FILE"
+    send_progress_event "FILE_DONE:$file:failed"
     echo "failed"
   fi
 }
@@ -561,6 +1494,17 @@ display_conversion_parameters() {
     log "Parallel: Yes, $PARALLEL_JOBS workers" "INFO" "$C_BLUE" "force"
   else
     log "Parallel: No (sequential)" "INFO" "$C_BLUE" "force"
+  fi
+  if [ "$ANALYZE_BPM" = "true" ] || [ "$ANALYZE_KEY" = "true" ]; then
+    local tag_info="BPM=${ANALYZE_BPM}, Key=${ANALYZE_KEY}"
+    [ "$ANALYZE_KEY" = "true" ] && tag_info="${tag_info} (format: ${KEY_FORMAT})"
+    log "Tag analysis: ${tag_info}" "INFO" "$C_BLUE" "force"
+  fi
+  if [ "$VERIFY_INTEGRITY" = "true" ]; then
+    log "Integrity check: ENABLED (waveform comparison)" "INFO" "$C_BLUE" "force"
+  fi
+  if [ "$CLEAN_METADATA" = "true" ]; then
+    log "Clean metadata: ENABLED (Artist/Title/Album/Track from tags+filename; output renamed to Artist - Title.wav)" "INFO" "$C_BLUE" "force"
   fi
   log "-----------------------------" "INFO" "$C_BLUE" "force"
 }
@@ -604,12 +1548,21 @@ main() {
 
   log "Found $total_files files to process" "INFO" "$C_GREEN" "force"
 
-  # Print initial empty lines for progress bar
-  echo "" >&2
-  echo "" >&2
+  # Launch GUI progress window (no-op when headless or customtkinter absent)
+  [ "$total_files" -gt 0 ] && launch_progress_window "$total_files" "$PARALLEL_JOBS"
+
+  # When GUI is active, 1 worker is dedicated to the progress window
+  local file_workers="$PARALLEL_JOBS"
+  [ -n "$PROGRESS_FIFO" ] && file_workers=$(( PARALLEL_JOBS > 1 ? PARALLEL_JOBS - 1 : 1 ))
+
+  # Initial blank lines only needed for the terminal progress bar
+  if [ -z "$PROGRESS_FIFO" ]; then
+    echo "" >&2
+    echo "" >&2
+  fi
 
   # --- Process files ---
-  if [ "$PARALLEL_JOBS" -le 1 ]; then
+  if [ "$file_workers" -le 1 ]; then
     # === Sequential mode (original behavior) ===
     for file in "${files_to_process[@]}"; do
       processed_files=$((processed_files + 1))
@@ -658,13 +1611,13 @@ main() {
       active_jobs=$((active_jobs + 1))
 
       # When job pool is full, wait for one to finish
-      if [ "$active_jobs" -ge "$PARALLEL_JOBS" ]; then
+      if [ "$active_jobs" -ge "$file_workers" ]; then
         wait -n 2>/dev/null || true
         active_jobs=$((active_jobs - 1))
         # Update progress based on completed result files
         local completed
         completed=$(find "$results_dir" -maxdepth 1 -type f | wc -l)
-        update_progress_bar "$completed" "$total_files" "$C_YELLOW" "$PARALLEL_JOBS parallel workers"
+        update_progress_bar "$completed" "$total_files" "$C_YELLOW" "$file_workers parallel workers"
       fi
     done
 
@@ -672,7 +1625,7 @@ main() {
     wait || true
 
     # Final progress update
-    update_progress_bar "$total_files" "$total_files" "$C_YELLOW" "$PARALLEL_JOBS parallel workers"
+    update_progress_bar "$total_files" "$total_files" "$C_YELLOW" "$file_workers parallel workers"
 
     # Tally results from result files
     for i in "${!files_to_process[@]}"; do
@@ -711,8 +1664,11 @@ main() {
     trap - EXIT
   fi
 
-  # Move cursor to the next line
-  echo "" >&2
+  # Close progress window (sends DONE, waits for Python to exit)
+  close_progress_window
+
+  # Move cursor to the next line (terminal progress bar only)
+  [ -z "$PROGRESS_FIFO" ] && echo "" >&2
 
   # --- Final summary (console) ---
   log "Conversion process finished" "INFO" "$C_GREEN" "force"
@@ -743,6 +1699,16 @@ main() {
         echo "Parallel:      $PARALLEL_JOBS jobs"
       else
         echo "Parallel:      No (sequential)"
+      fi
+      if [ "$ANALYZE_BPM" = "true" ] || [ "$ANALYZE_KEY" = "true" ]; then
+        echo "BPM tagging:   $ANALYZE_BPM"
+        echo "Key tagging:   $ANALYZE_KEY (format: $KEY_FORMAT)"
+      fi
+      if [ "$VERIFY_INTEGRITY" = "true" ]; then
+        echo "Integrity:     Enabled (waveform comparison)"
+      fi
+      if [ "$CLEAN_METADATA" = "true" ]; then
+        echo "Clean metadata: Enabled"
       fi
       echo ""
       echo "--- Results ---"
